@@ -1,0 +1,700 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'ECS Deployment with Frontend, Backend, Aurora PostgreSQL in Private Subnets, and Bastion Host - devopstrends.online'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: devopstrends
+    Description: Project name used for resource naming
+
+  DomainName:
+    Type: String
+    Default: devopstrends.online
+    Description: Domain name for the application
+
+  DatabaseName:
+    Type: String
+    Default: testdb
+    Description: PostgreSQL database name
+
+  DatabaseUsername:
+    Type: String
+    Default: postgres
+    Description: PostgreSQL master username
+
+  DatabasePassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    MaxLength: 41
+    Description: PostgreSQL master password (8-41 characters)
+    Default: DevOps2024!Secure
+
+  BackendImageUri:
+    Type: String
+    Description: Backend Docker image URI from ECR (e.g., 123456789012.dkr.ecr.ap-south-1.amazonaws.com/devopstrends-backend:latest)
+
+  FrontendImageUri:
+    Type: String
+    Description: Frontend Docker image URI from ECR (e.g., 123456789012.dkr.ecr.ap-south-1.amazonaws.com/devopstrends-frontend:latest)
+
+  BastionKeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access to Bastion Host
+
+  BastionAllowedSSHCIDR:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR block allowed to SSH to Bastion Host (recommend restricting to your IP)
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Configuration"
+        Parameters:
+          - ProjectName
+          - DomainName
+      - Label:
+          default: "Database Configuration"
+        Parameters:
+          - DatabaseName
+          - DatabaseUsername
+          - DatabasePassword
+      - Label:
+          default: "Container Images"
+        Parameters:
+          - BackendImageUri
+          - FrontendImageUri
+      - Label:
+          default: "Bastion Host Configuration"
+        Parameters:
+          - BastionKeyPairName
+          - BastionAllowedSSHCIDR
+
+Mappings:
+  AWSRegion2AMI:
+    us-east-1:
+      AMI: ami-0c02fb55b2f7760f6
+    us-east-2:
+      AMI: ami-0a0c5f8b8f9e4e7d2
+    us-west-1:
+      AMI: ami-0d5eff06f840b45e9
+    us-west-2:
+      AMI: ami-0c55b159cbfafe1f0
+    ap-south-1:
+      AMI: ami-0c2af51e265bd5e0e
+    ap-northeast-1:
+      AMI: ami-0d979355d03fa2522
+    ap-southeast-1:
+      AMI: ami-0c802847a7dd848c0
+    ap-southeast-2:
+      AMI: ami-0c6120f461d6b39e9
+    eu-central-1:
+      AMI: ami-0a1ee2fb28fe05df3
+    eu-west-1:
+      AMI: ami-0d71ea30463e0ff8d
+
+Resources:
+  # ==========================================
+  # VPC and Networking
+  # ==========================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnets (for ECS Applications and Bastion)
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet-1'
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet-2'
+
+  # Private Subnets for RDS ONLY
+  PrivateSubnetDB1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.20.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-db-subnet-1'
+
+  PrivateSubnetDB2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.21.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-db-subnet-2'
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-rt'
+
+  PrivateSubnetDB1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetDB1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetDB2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetDB2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ==========================================
+  # Security Groups
+  # ==========================================
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-bastion-sg'
+      GroupDescription: Security group for Bastion Host
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref BastionAllowedSSHCIDR
+          Description: Allow SSH from specified CIDR
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-bastion-sg'
+
+  FrontendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-frontend-sg'
+      GroupDescription: Security group for Frontend ECS tasks
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP from anywhere
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS from anywhere
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-frontend-sg'
+
+  BackendSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-backend-sg'
+      GroupDescription: Security group for Backend ECS tasks
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref FrontendSecurityGroup
+          Description: Allow traffic from Frontend
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+          Description: Allow traffic from public internet
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-backend-sg'
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-rds-sg'
+      GroupDescription: Security group for RDS Aurora PostgreSQL (Private Subnets Only)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BackendSecurityGroup
+          Description: Allow PostgreSQL from Backend ECS tasks
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: Allow PostgreSQL from Bastion Host
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-rds-sg'
+
+  # ==========================================
+  # Bastion Host
+  # ==========================================
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !FindInMap [AWSRegion2AMI, !Ref 'AWS::Region', AMI]
+      KeyName: !Ref BastionKeyPairName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      IamInstanceProfile: !Ref BastionInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y postgresql15
+          
+          # Create connection script
+          cat > /home/ec2-user/connect-to-rds.sh << 'EOF'
+          #!/bin/bash
+          echo "Connecting to Aurora PostgreSQL..."
+          psql -h ${AuroraCluster.Endpoint.Address} -U ${DatabaseUsername} -d ${DatabaseName}
+          EOF
+          
+          chmod +x /home/ec2-user/connect-to-rds.sh
+          chown ec2-user:ec2-user /home/ec2-user/connect-to-rds.sh
+          
+          echo "Bastion host setup complete!"
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-bastion-host'
+
+  BastionEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref BastionHost
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-bastion-eip'
+
+  BastionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-bastion-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-bastion-role'
+
+  BastionInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-bastion-profile'
+      Roles:
+        - !Ref BastionRole
+
+  # ==========================================
+  # RDS Aurora PostgreSQL Serverless (Private Subnets Only)
+  # ==========================================
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${ProjectName}-db-subnet-group'
+      DBSubnetGroupDescription: Subnet group for Aurora PostgreSQL (Private Subnets Only)
+      SubnetIds:
+        - !Ref PrivateSubnetDB1
+        - !Ref PrivateSubnetDB2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-db-subnet-group'
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DBClusterIdentifier: !Sub '${ProjectName}-aurora-cluster'
+      Engine: aurora-postgresql
+      EngineMode: provisioned
+      EngineVersion: '17'
+      DatabaseName: !Ref DatabaseName
+      MasterUsername: !Ref DatabaseUsername
+      MasterUserPassword: !Ref DatabasePassword
+      Port: 5432
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref RDSSecurityGroup
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'mon:04:00-mon:05:00'
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 1.0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-aurora-cluster'
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-aurora-instance'
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-aurora-instance'
+
+  # ==========================================
+  # ECS Cluster
+  # ==========================================
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-cluster'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cluster'
+
+  # ==========================================
+  # CloudWatch Log Groups
+  # ==========================================
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-backend'
+      RetentionInDays: 7
+
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-frontend'
+      RetentionInDays: 7
+
+  # ==========================================
+  # IAM Roles
+  # ==========================================
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ecs-task-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ecs-task-execution-role'
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-ecs-task-role'
+
+  # ==========================================
+  # ECS Task Definitions
+  # ==========================================
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-backend'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Ref BackendImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: DB_HOST
+              Value: !GetAtt AuroraCluster.Endpoint.Address
+            - Name: DB_PORT
+              Value: '5432'
+            - Name: DB_NAME
+              Value: !Ref DatabaseName
+            - Name: DB_USER
+              Value: !Ref DatabaseUsername
+            - Name: DB_PASSWORD
+              Value: !Ref DatabasePassword
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref BackendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-backend-task'
+
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-frontend'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: frontend
+          Image: !Ref FrontendImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FrontendLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-frontend-task'
+
+  # ==========================================
+  # ECS Services (In Public Subnets)
+  # ==========================================
+  BackendService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - AuroraInstance
+    Properties:
+      ServiceName: !Sub '${ProjectName}-backend-service'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref BackendSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-backend-service'
+
+  FrontendService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - BackendService
+    Properties:
+      ServiceName: !Sub '${ProjectName}-frontend-service'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref FrontendTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref FrontendSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-frontend-service'
+
+# ==========================================
+# Outputs
+# ==========================================
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${ProjectName}-vpc-id'
+
+  BastionHostPublicIP:
+    Description: Bastion Host Public IP (Elastic IP)
+    Value: !Ref BastionEIP
+
+  BastionHostId:
+    Description: Bastion Host Instance ID
+    Value: !Ref BastionHost
+
+  BastionSSHCommand:
+    Description: SSH command to connect to Bastion Host
+    Value: !Sub 'ssh -i your-key.pem ec2-user@${BastionEIP}'
+
+  DatabaseConnectionFromBastion:
+    Description: Command to connect to RDS from Bastion
+    Value: !Sub 'psql -h ${AuroraCluster.Endpoint.Address} -U ${DatabaseUsername} -d ${DatabaseName} -p 5432'
+
+  ECSClusterName:
+    Description: ECS Cluster Name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${ProjectName}-cluster-name'
+
+  BackendServiceName:
+    Description: Backend ECS Service Name
+    Value: !GetAtt BackendService.Name
+    Export:
+      Name: !Sub '${ProjectName}-backend-service'
+
+  FrontendServiceName:
+    Description: Frontend ECS Service Name
+    Value: !GetAtt FrontendService.Name
+    Export:
+      Name: !Sub '${ProjectName}-frontend-service'
+
+  AuroraEndpoint:
+    Description: Aurora PostgreSQL Cluster Endpoint (Private - Port 5432)
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${ProjectName}-aurora-endpoint'
+
+  AuroraPort:
+    Description: Aurora PostgreSQL Port
+    Value: '5432'
+
+  DatabaseName:
+    Description: Database Name
+    Value: !Ref DatabaseName
+
+  PublicSubnet1Id:
+    Description: Public Subnet 1 ID (ECS Applications)
+    Value: !Ref PublicSubnet1
+
+  PublicSubnet2Id:
+    Description: Public Subnet 2 ID (ECS Applications)
+    Value: !Ref PublicSubnet2
+
+  PrivateSubnetDB1Id:
+    Description: Private DB Subnet 1 ID (RDS Only)
+    Value: !Ref PrivateSubnetDB1
+
+  PrivateSubnetDB2Id:
+    Description: Private DB Subnet 2 ID (RDS Only)
+    Value: !Ref PrivateSubnetDB2
+
+  NextSteps:
+    Description: Next Steps
+    Value: |
+      1. SSH to Bastion Host: ssh -i your-key.pem ec2-user@<BastionEIP>
+      2. From Bastion, connect to RDS: ./connect-to-rds.sh
+      3. Get Frontend/Backend Task Public IPs from ECS Console
+      4. Create Route53 A record pointing devopstrends.online to Frontend Task IP
+      5. Access application at http://devopstrends.online
+
