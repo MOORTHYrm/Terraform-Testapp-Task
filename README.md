@@ -1,3 +1,5 @@
+ #Aws Cloudformation and TerraformCode
+
 1. VPC & Networking: VPC with public/private subnets across 2 availability zones (ap-south-1a, ap-south-1b)
 2. Security Groups: Separate security groups for ALB, Frontend, Backend, ECS Tasks, Bastion, and RDS
 3. Application Load Balancer: With listeners on ports 80 (frontend) and 3000 (backend)
